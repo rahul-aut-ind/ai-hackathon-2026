@@ -17,7 +17,6 @@ concurrency:
 jobs:
   update-changelog:
     if: github.event.pull_request.merged == true
-
     runs-on: ubuntu-latest
 
     steps:
@@ -35,8 +34,9 @@ jobs:
         id: metadata
         env:
           GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
-          gh pr view ${{ github.event.pull_request.number }} \
+          gh pr view "$PR_NUMBER" \
             --json files \
             > pr_files.json
 
@@ -49,22 +49,19 @@ jobs:
           fi
 
           echo "$FILES" > changed_files.txt
-          echo "file_count=$FILE_COUNT" >> $GITHUB_OUTPUT
+          echo "file_count=$FILE_COUNT" >> "$GITHUB_OUTPUT"
 
       - name: Build AI prompt
         id: prompt
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE:  ${{ github.event.pull_request.title }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_BODY:   ${{ github.event.pull_request.body }}
+          PR_BRANCH: ${{ github.event.pull_request.head.ref }}
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ', ') }}
         run: |
-          PR_NUMBER="${{ github.event.pull_request.number }}"
-          PR_TITLE="${{ github.event.pull_request.title }}"
-          PR_AUTHOR="${{ github.event.pull_request.user.login }}"
-          PR_BODY=$(cat <<'BODY_EOF'
-          ${{ github.event.pull_request.body }}
-          BODY_EOF
-          )
-
-          LABELS=$(echo '${{ toJson(github.event.pull_request.labels.*.name) }}' \
-            | jq -r '.[]' 2>/dev/null | tr '\n' ', ' | sed 's/,$//')
-
           COMMITS=$(gh pr view "$PR_NUMBER" \
             --json commits \
             --jq '.commits[].messageHeadline' \
@@ -75,9 +72,9 @@ jobs:
           jq -n \
             --arg title   "$PR_TITLE" \
             --arg body    "$PR_BODY" \
-            --arg branch  "${{ github.event.pull_request.head.ref }}" \
+            --arg branch  "$PR_BRANCH" \
             --arg author  "$PR_AUTHOR" \
-            --arg labels  "$LABELS" \
+            --arg labels  "$PR_LABELS" \
             --arg commits "$COMMITS" \
             --arg files   "$FILES" \
             '{
@@ -90,8 +87,7 @@ jobs:
               files:   $files
             }' > pr_data.json
 
-          # Build the prompt text referencing the safe JSON values
-          PROMPT=$(jq -r '
+          jq -r '
             "You are generating a professional CHANGELOG.md entry.\n\n" +
             "Requirements:\n" +
             "- Output ONLY markdown\n" +
@@ -114,8 +110,6 @@ jobs:
           ' pr_data.json > prompt.txt
 
           echo "Prompt built successfully ($(wc -c < prompt.txt) bytes)"
-        env:
-          GH_TOKEN: ${{ github.token }}
 
       - name: Generate changelog entry via Gemini
         id: gemini
@@ -163,25 +157,28 @@ jobs:
           echo "✅ Changelog entry generated ($(wc -c < gemini_entry.txt) bytes)"
 
       - name: Update CHANGELOG.md
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_URL:    ${{ github.event.pull_request.html_url }}
         run: |
           DATE=$(date +"%Y-%m-%d")
-          PR_NUMBER="${{ github.event.pull_request.number }}"
-          PR_URL="${{ github.event.pull_request.html_url }}"
-
-
           SENTINEL="<!-- CHANGELOG_ENTRIES_START -->"
           TEMP_FILE=$(mktemp)
 
           if [ ! -f CHANGELOG.md ]; then
-            echo "# Changelog" > CHANGELOG.md
-            echo "" >> CHANGELOG.md
-            echo "$SENTINEL" >> CHANGELOG.md
-            echo "" >> CHANGELOG.md
+            printf '# Changelog\n\n%s\n\n' "$SENTINEL" > CHANGELOG.md
           elif ! grep -qF "$SENTINEL" CHANGELOG.md; then
-            sed -i "0,/^# /{/^# /a\\
-          \\
-          $SENTINEL
-          }" CHANGELOG.md
+            awk -v sentinel="$SENTINEL" '
+              !inserted && /^# / {
+                print
+                print ""
+                print sentinel
+                inserted=1
+                next
+              }
+              { print }
+            ' CHANGELOG.md > "$TEMP_FILE"
+            mv "$TEMP_FILE" CHANGELOG.md
           fi
 
           {
@@ -191,7 +188,8 @@ jobs:
             echo ""
           } > new_entry.txt
 
-          awk -v entry="$(cat new_entry.txt)" \
+          awk \
+            -v entry="$(cat new_entry.txt)" \
             -v sentinel="$SENTINEL" '
             {
               print
@@ -206,6 +204,8 @@ jobs:
           echo "✅ CHANGELOG.md updated"
 
       - name: Commit and push changelog
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -214,7 +214,7 @@ jobs:
 
           git diff --cached --quiet && echo "No changes to commit." && exit 0
 
-          git commit -m "docs(changelog): update for PR #${{ github.event.pull_request.number }} [skip ci]"
+          git commit -m "docs(changelog): update for PR #${PR_NUMBER} [skip ci]"
 
           git pull --rebase origin main
           git push
