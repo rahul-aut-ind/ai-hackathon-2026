@@ -216,9 +216,12 @@ jobs:
 
           # Push to a short-lived branch — never directly to main
           BRANCH="changelog/pr-${PR_NUMBER}"
+
+          git push origin --delete "$BRANCH" 2>/dev/null || true
+
           git checkout -b "$BRANCH"
           git commit -m "docs(changelog): update for PR #${PR_NUMBER} [skip ci]"
-          git push origin "$BRANCH"
+          git push origin "$BRANCH" --force
 
           # Open a PR and immediately enable auto-merge.
           # The loop-prevention condition above ensures this PR's
