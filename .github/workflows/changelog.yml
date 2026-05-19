@@ -1,0 +1,220 @@
+name: AI Changelog Updater
+
+on:
+  pull_request:
+    types: [closed]
+    branches:
+      - main
+
+permissions:
+  contents: write
+  pull-requests: read
+
+concurrency:
+  group: changelog-writer
+  cancel-in-progress: false
+
+jobs:
+  update-changelog:
+    if: github.event.pull_request.merged == true
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y jq
+
+      - name: Fetch PR file list
+        id: metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr view ${{ github.event.pull_request.number }} \
+            --json files \
+            > pr_files.json
+
+          FILE_COUNT=$(jq '.files | length' pr_files.json)
+          FILES=$(jq -r '.files[].path' pr_files.json | head -30)
+
+          if [ "$FILE_COUNT" -gt 30 ]; then
+            FILES="$FILES
+          ... and $((FILE_COUNT - 30)) more files (truncated)"
+          fi
+
+          echo "$FILES" > changed_files.txt
+          echo "file_count=$FILE_COUNT" >> $GITHUB_OUTPUT
+
+      - name: Build AI prompt
+        id: prompt
+        run: |
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          PR_TITLE="${{ github.event.pull_request.title }}"
+          PR_AUTHOR="${{ github.event.pull_request.user.login }}"
+          PR_BODY=$(cat <<'BODY_EOF'
+          ${{ github.event.pull_request.body }}
+          BODY_EOF
+          )
+
+          LABELS=$(echo '${{ toJson(github.event.pull_request.labels.*.name) }}' \
+            | jq -r '.[]' 2>/dev/null | tr '\n' ', ' | sed 's/,$//')
+
+          COMMITS=$(gh pr view "$PR_NUMBER" \
+            --json commits \
+            --jq '.commits[].messageHeadline' \
+            2>/dev/null || echo "unavailable")
+
+          FILES=$(cat changed_files.txt)
+
+          jq -n \
+            --arg title   "$PR_TITLE" \
+            --arg body    "$PR_BODY" \
+            --arg branch  "${{ github.event.pull_request.head.ref }}" \
+            --arg author  "$PR_AUTHOR" \
+            --arg labels  "$LABELS" \
+            --arg commits "$COMMITS" \
+            --arg files   "$FILES" \
+            '{
+              title:   $title,
+              body:    $body,
+              branch:  $branch,
+              author:  $author,
+              labels:  $labels,
+              commits: $commits,
+              files:   $files
+            }' > pr_data.json
+
+          # Build the prompt text referencing the safe JSON values
+          PROMPT=$(jq -r '
+            "You are generating a professional CHANGELOG.md entry.\n\n" +
+            "Requirements:\n" +
+            "- Output ONLY markdown\n" +
+            "- Keep it concise but meaningful\n" +
+            "- Focus on user-visible or developer-impacting changes\n" +
+            "- Infer intent from PR title, body, branch name, commit messages, changed files, and Jira ticket references\n" +
+            "- Ignore trivial/internal noise (e.g. formatting-only changes)\n" +
+            "- Group items under: Added | Changed | Fixed | Removed\n" +
+            "- Omit empty sections\n" +
+            "- Do not invent functionality\n" +
+            "- If Jira ticket IDs exist (e.g. PROJ-123), preserve them in entries\n" +
+            "- Use clean release-note style wording\n\n" +
+            "PR TITLE:\n" + .title + "\n\n" +
+            "PR BODY:\n" + .body + "\n\n" +
+            "SOURCE BRANCH:\n" + .branch + "\n\n" +
+            "AUTHOR:\n" + .author + "\n\n" +
+            "LABELS:\n" + .labels + "\n\n" +
+            "COMMIT MESSAGES:\n" + .commits + "\n\n" +
+            "CHANGED FILES:\n" + .files
+          ' pr_data.json > prompt.txt
+
+          echo "Prompt built successfully ($(wc -c < prompt.txt) bytes)"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Generate changelog entry via Gemini
+        id: gemini
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          jq -n \
+            --rawfile prompt prompt.txt \
+            '{
+              contents: [{
+                parts: [{ text: $prompt }]
+              }],
+              generationConfig: {
+                temperature: 0.2,
+                topK: 40,
+                topP: 0.95,
+                maxOutputTokens: 1024
+              }
+            }' > request.json
+
+          curl -sf \
+            -X POST \
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d @request.json \
+            > response.json
+
+          API_ERROR=$(jq -r '.error.message // empty' response.json)
+          if [ -n "$API_ERROR" ]; then
+            echo "❌ Gemini API error: $API_ERROR"
+            exit 1
+          fi
+
+          CHANGELOG_CONTENT=$(jq -r \
+            '.candidates[0].content.parts[0].text // empty' \
+            response.json)
+
+          if [ -z "$CHANGELOG_CONTENT" ]; then
+            echo "❌ Gemini returned empty content. Full response:"
+            cat response.json
+            exit 1
+          fi
+
+          echo "$CHANGELOG_CONTENT" > gemini_entry.txt
+          echo "✅ Changelog entry generated ($(wc -c < gemini_entry.txt) bytes)"
+
+      - name: Update CHANGELOG.md
+        run: |
+          DATE=$(date +"%Y-%m-%d")
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          PR_URL="${{ github.event.pull_request.html_url }}"
+
+
+          SENTINEL="<!-- CHANGELOG_ENTRIES_START -->"
+          TEMP_FILE=$(mktemp)
+
+          if [ ! -f CHANGELOG.md ]; then
+            echo "# Changelog" > CHANGELOG.md
+            echo "" >> CHANGELOG.md
+            echo "$SENTINEL" >> CHANGELOG.md
+            echo "" >> CHANGELOG.md
+          elif ! grep -qF "$SENTINEL" CHANGELOG.md; then
+            sed -i "0,/^# /{/^# /a\\
+          \\
+          $SENTINEL
+          }" CHANGELOG.md
+          fi
+
+          {
+            echo "## ${DATE} — [PR #${PR_NUMBER}](${PR_URL})"
+            echo ""
+            cat gemini_entry.txt
+            echo ""
+          } > new_entry.txt
+
+          awk -v entry="$(cat new_entry.txt)" \
+            -v sentinel="$SENTINEL" '
+            {
+              print
+              if ($0 == sentinel) {
+                print ""
+                print entry
+              }
+            }
+          ' CHANGELOG.md > "$TEMP_FILE"
+
+          mv "$TEMP_FILE" CHANGELOG.md
+          echo "✅ CHANGELOG.md updated"
+
+      - name: Commit and push changelog
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add CHANGELOG.md
+
+          git diff --cached --quiet && echo "No changes to commit." && exit 0
+
+          git commit -m "docs(changelog): update for PR #${{ github.event.pull_request.number }} [skip ci]"
+
+          git pull --rebase origin main
+          git push
