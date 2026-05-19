@@ -214,15 +214,14 @@ jobs:
           git add CHANGELOG.md
           git diff --cached --quiet && echo "No changes to commit." && exit 0
 
-          # Push to a short-lived branch — never directly to main
           BRANCH="changelog/pr-${PR_NUMBER}"
+
+          git push origin --delete "$BRANCH" 2>/dev/null || true
+
           git checkout -b "$BRANCH"
           git commit -m "docs(changelog): update for PR #${PR_NUMBER} [skip ci]"
-          git push origin "$BRANCH"
+          git push origin "$BRANCH" --force
 
-          # Open a PR and immediately enable auto-merge.
-          # The loop-prevention condition above ensures this PR's
-          # merge does NOT trigger another changelog run.
           gh pr create \
             --title "docs(changelog): update for PR #${PR_NUMBER} [skip ci]" \
             --body  "Automated changelog update. Triggered by PR #${PR_NUMBER}." \
