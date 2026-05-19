@@ -1,6 +1,6 @@
 ### Background 📜
 
-🔗 [Ticket Link](https://gymondo.atlassian.net/browse/GM-CODE)
+🔗 [Ticket Link](https://<org-name>.atlassian.net/browse/GM-CODE)
 
 🤓 Description:
 
