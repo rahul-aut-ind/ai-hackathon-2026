@@ -2,6 +2,11 @@
 
 <!-- CHANGELOG_ENTRIES_START -->
 
+## 2026-05-21 — [PR #8](https://github.com/rahul-aut-ind/ai-hackathon-2026/pull/8)
+
+### Added
+- Added a new feature demonstration. [AH-0019]
+
 ## 2026-05-19 — [PR #6](https://github.com/rahul-aut-ind/ai-hackathon-2026/pull/6)
 
 ### Added
